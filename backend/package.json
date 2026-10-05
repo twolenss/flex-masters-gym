@@ -1,0 +1,5 @@
+{
+  "name": "flex-master-backend",
+  "private": true,
+  "scripts": { "start": "node --env-file-if-exists=../.env server.mjs", "migrate": "node --env-file=../.env database/migrate.mjs" }
+}

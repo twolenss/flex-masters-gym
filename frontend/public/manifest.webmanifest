@@ -1,0 +1,12 @@
+{
+  "name": "Flex-Master Gym",
+  "short_name": "Flex-Master",
+  "description": "Gym membership and check-in management for administrators.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#171727",
+  "theme_color": "#171727",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

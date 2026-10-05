@@ -1,0 +1,22 @@
+{
+  "name": "flex-master-gym",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite --config frontend/vite.config.mjs frontend",
+    "build": "vite build --config frontend/vite.config.mjs frontend",
+    "preview": "vite preview --config frontend/vite.config.mjs frontend",
+    "server": "node --env-file-if-exists=.env backend/server.mjs",
+    "db:migrate": "node --env-file=.env backend/database/migrate.mjs"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "@zxing/browser": "^0.2.1",
+    "lucide-react": "latest",
+    "pg": "^8.23.1",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest",
+    "zod": "^4.6.5"
+  }
+}
