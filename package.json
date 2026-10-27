@@ -11,12 +11,13 @@
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
-    "@zxing/browser": "^0.2.1",
+    "@zxing/browser": "0.1.5",
     "lucide-react": "latest",
     "pg": "^8.23.1",
+    "qrcode": "^1.5.4",
     "react": "latest",
     "react-dom": "latest",
-    "vite": "latest",
-    "zod": "^4.6.5"
+    "vite": "^8.3.5",
+    "zod": "^4.6.6"
   }
 }

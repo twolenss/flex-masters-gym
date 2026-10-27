@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { readFile, writeFile, mkdir, stat } from 'node:fs/promises';
-import { createHash, randomBytes, timingSafeEqual, scryptSync } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual, scryptSync } from 'node:crypto';
 import { extname, join, normalize } from 'node:path';
 import { env } from './config/env.mjs';
 import { memberCreateSchema, renewalSchema, guestSchema } from './validation/member.mjs';
@@ -10,7 +10,6 @@ import { pool } from './database/pool.mjs';
 
 const PORT = env.port;
 const DB_PATH = './data/flex-master-db.json';
-const sessions = new Map();
 let stateRepository = env.databaseUrl ? new PostgresStateRepository() : null;
 if (stateRepository) {
   try {
@@ -31,7 +30,7 @@ const verifyPassword = (value, stored) => {
   return timingSafeEqual(Buffer.from(actual),Buffer.from(expected));
 };
 const initialDb = {
-  admin: { id: 'admin-001', email: 'admin@flexmaster.gym', passwordHash: passwordHash('flexmaster2026'), name: 'Alex Morgan' },
+  admin: { id: 'admin-001', email: env.adminEmail.toLowerCase(), passwordHash: passwordHash(env.adminPassword), name: 'Alex Morgan' },
   state: { members: [], visits: [], payments: [] },
   createdAt: new Date().toISOString()
 };
@@ -43,7 +42,29 @@ async function readDb(){
 }
 async function writeDb(db){ if(stateRepository) return stateRepository.save(db); await mkdir('./data', {recursive:true}); await writeFile(DB_PATH, JSON.stringify(db, null, 2)); }
 function readBody(req){ return new Promise((resolve,reject)=>{ let raw=''; req.on('data',chunk=>{raw+=chunk;if(raw.length>700_000)req.destroy(new Error('Request body too large'));}); req.on('end',()=>{try{resolve(raw?JSON.parse(raw):{})}catch{reject(new Error('Invalid JSON body'))}}); req.on('error',reject); }); }
-function auth(req){ const token=(req.headers.authorization||'').replace(/^Bearer\s+/i,''); return token && sessions.get(token); }
+function signSession(payload) { const encoded=Buffer.from(JSON.stringify(payload)).toString('base64url'); const signature=createHmac('sha256',env.sessionSecret).update(encoded).digest('base64url'); return `${encoded}.${signature}`; }
+function auth(req){
+  const token=(req.headers.authorization||'').replace(/^Bearer\s+/i,''); const [encoded,signature]=token.split('.');
+  if(!encoded||!signature)return null;
+  const expected=createHmac('sha256',env.sessionSecret).update(encoded).digest('base64url');
+  if(signature.length!==expected.length||!timingSafeEqual(Buffer.from(signature),Buffer.from(expected)))return null;
+  try { const payload=JSON.parse(Buffer.from(encoded,'base64url').toString('utf8')); return payload.exp>Date.now()?payload:null; } catch { return null; }
+}
+const loginFailures = new Map();
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const MAX_LOGIN_FAILURES = 5;
+const clientAddress = req => req.socket.remoteAddress || "unknown";
+function canAttemptLogin(address) {
+  const now = Date.now();
+  const attempts = (loginFailures.get(address) || []).filter(time => now - time < LOGIN_WINDOW_MS);
+  if (attempts.length) loginFailures.set(address, attempts); else loginFailures.delete(address);
+  return attempts.length < MAX_LOGIN_FAILURES;
+}
+function recordLoginFailure(address) {
+  const attempts = loginFailures.get(address) || [];
+  attempts.push(Date.now());
+  loginFailures.set(address, attempts);
+}
 function mime(path){ return ({'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css','.svg':'image/svg+xml','.json':'application/json','.webmanifest':'application/manifest+json'})[extname(path)] || 'application/octet-stream'; }
 const id = prefix => `${prefix}-${randomBytes(5).toString('hex').toUpperCase()}`;
 const today = () => new Date().toISOString().slice(0,10);
@@ -59,14 +80,17 @@ const server = createServer(async (req,res)=>{
   try {
     if(req.method==='GET' && url.pathname==='/api/health') return json(res,200,{ok:true,service:'flex-master-api',storage:stateRepository?'postgresql':'json-fallback'});
     if(req.method==='POST' && url.pathname==='/api/auth/login'){
+      const address=clientAddress(req);
+      if(!canAttemptLogin(address)) return json(res,429,{error:'Too many failed sign-in attempts. Try again in 15 minutes.'});
       const {email,password}=await readBody(req); const db=await readDb();
       const valid=String(email||'').toLowerCase()===db.admin.email && verifyPassword(String(password||''),db.admin.passwordHash);
-      if(!valid) return json(res,401,{error:'Invalid email or password'});
-      const token=randomBytes(32).toString('hex'); sessions.set(token,{adminId:db.admin.id,expires:Date.now()+1000*60*60*12});
+      if(!valid) { recordLoginFailure(address); return json(res,401,{error:'Invalid email or password'}); }
+      loginFailures.delete(address);
+      const token=signSession({adminId:db.admin.id,exp:Date.now()+1000*60*60*12});
       return json(res,200,{token,admin:{name:db.admin.name,email:db.admin.email}});
     }
     if(url.pathname.startsWith('/api/')){
-      const session=auth(req); if(!session || session.expires<Date.now()) return json(res,401,{error:'Unauthorized'});
+      const session=auth(req); if(!session || session.exp<Date.now()) return json(res,401,{error:'Unauthorized'});
       if(req.method==='GET' && url.pathname==='/api/state'){ const db=await readDb(); return json(res,200,db.state); }
       if(req.method==='GET' && url.pathname==='/api/members'){ const db=await readDb(); return json(res,200,db.state.members.map(currentMembership)); }
       if(req.method==='POST' && url.pathname==='/api/members'){
