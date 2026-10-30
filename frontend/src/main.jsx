@@ -32,7 +32,10 @@ import {
 import "./styles.css";
 
 if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js"));
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.getRegistrations().then(registrations => registrations.forEach(registration => registration.unregister()));
+    caches.keys().then(keys => Promise.all(keys.filter(key => key.startsWith("flex-master-")).map(key => caches.delete(key))));
+  });
 }
 
 const today = () => new Date().toISOString().slice(0, 10);
@@ -110,6 +113,7 @@ function App() {
     }
   });
   const [authed, setAuthed] = useState(() => Boolean(localStorage.flexmasterApiToken));
+  const [account, setAccount] = useState(() => { try { return JSON.parse(localStorage.flexmasterAccount || "null"); } catch { return null; } });
   const [page, setPage] = useState("Dashboard");
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(null);
@@ -118,6 +122,7 @@ function App() {
   const apiHeaders = () => ({ "Content-Type": "application/json", Authorization: "Bearer " + localStorage.flexmasterApiToken });
   useEffect(() => {
     if (!authed) return;
+    fetch("/api/auth/me", { headers: apiHeaders() }).then(async response => { if (response.ok) { const result = await response.json(); setAccount(result.account); localStorage.flexmasterAccount = JSON.stringify(result.account); } }).catch(() => {});
     fetch("/api/state", { headers: apiHeaders() })
       .then(async (response) => {
         if (response.status === 401) {
@@ -147,6 +152,7 @@ function App() {
     ["Guest Visits", UserRoundPlus],
     ["Check-Ins", ReceiptText],
     ["Payments", CreditCard],
+    ...(account?.role === "Owner" ? [["Staff Accounts", ShieldCheck]] : []),
     ["Settings", Settings],
   ];
   const openMember = (m) => {
@@ -233,18 +239,24 @@ function App() {
       <Visits visits={data.visits} />
     ) : page === "Payments" ? (
       <Payments payments={data.payments} />
+    ) : page === "Staff Accounts" ? (
+      <SettingsPage apiHeaders={apiHeaders} account={account} staffOnly />
     ) : (
-      <SettingsPage />
+      <SettingsPage apiHeaders={apiHeaders} account={account} />
     );
   const login = async (credentials) => {
     let response = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(credentials) });
-    if (!response.ok) throw new Error("Incorrect email or password. Try the demo credentials below.");
+    if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || "Incorrect email or password."); }
     let result = await response.json();
     localStorage.flexmasterApiToken = result.token;
+    localStorage.flexmasterAccount = JSON.stringify(result.account);
+    setAccount(result.account);
     setAuthed(true);
   };
   const logout = () => {
     localStorage.removeItem("flexmasterApiToken");
+    localStorage.removeItem("flexmasterAccount");
+    setAccount(null);
     setAuthed(false);
     setPage("Dashboard");
   };
@@ -280,10 +292,10 @@ function App() {
           ))}
         </nav>
         <button className="owner" onClick={logout}>
-          <div className="avatar dark">AM</div>
+          <div className="avatar dark">{account?.name?.split(" ").map(part => part[0]).join("").slice(0, 2) || "FM"}</div>
           <div>
-            <b>Alex Morgan</b>
-            <small>Gym Administrator</small>
+            <b>{account?.name || "Flex-Master Staff"}</b>
+            <small>{account?.role || "Staff"}</small>
           </div>
           <LogOut size={17} />
         </button>
@@ -319,7 +331,7 @@ function App() {
   );
 }
 function Login({ onLogin }) {
-  const [email, setEmail] = useState("admin@flexmaster.gym");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [show, setShow] = useState(false);
   const [error, setError] = useState("");
@@ -392,11 +404,6 @@ function Login({ onLogin }) {
             <LockKeyhole size={17} />
             {loading ? "Signing in…" : "Sign in"}
           </button>
-          <div className="demo-login">
-            <b>Demo account</b>
-            <span>admin@flexmaster.gym</span>
-            <code>flexmaster2026</code>
-          </div>
         </form>
       </section>
     </div>
@@ -1149,19 +1156,24 @@ function Payments({ payments }) {
     </>
   );
 }
-function SettingsPage() {
-  return (
-    <div className="card settings">
-      <span className="round violet">
-        <Settings />
-      </span>
-      <h2>Gym settings</h2>
-      <p>Business settings and administrator credentials can be configured here in the production system.</p>
-      <div>
-        <b>Flex-Master Gym</b>
-        <small>Manila, Philippines · Admin access enabled</small>
-      </div>
-    </div>
-  );
+function SettingsPage({ apiHeaders, account, staffOnly = false }) {
+  const [accounts, setAccounts] = useState([]);
+  const [password, setPassword] = useState({ currentPassword: "", newPassword: "" });
+  const [staff, setStaff] = useState({ name: "", email: "", password: "", role: "Receptionist" });
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const owner = account?.role === "Owner";
+  const request = async (url, options = {}) => { const response = await fetch(url, { ...options, headers: { ...apiHeaders(), ...(options.headers || {}) } }); const body = await response.json(); if (!response.ok) throw new Error(body.error || "Request failed"); return body; };
+  const loadAccounts = async () => { if (!owner) return; try { setAccounts(await request("/api/accounts")); } catch (err) { setError(err.message); } };
+  useEffect(() => { loadAccounts(); }, [owner]);
+  const changePassword = async e => { e.preventDefault(); setError(""); try { await request("/api/auth/change-password", { method: "POST", body: JSON.stringify(password) }); setPassword({ currentPassword: "", newPassword: "" }); setNotice("Password changed successfully."); } catch (err) { setError(err.message); } };
+  const addStaff = async e => { e.preventDefault(); setError(""); try { await request("/api/accounts", { method: "POST", body: JSON.stringify(staff) }); setStaff({ name: "", email: "", password: "", role: "Receptionist" }); await loadAccounts(); setNotice("Staff account created."); } catch (err) { setError(err.message); } };
+  const updateStaff = async (item, changes) => { setError(""); try { await request("/api/accounts/" + encodeURIComponent(item.id), { method: "PUT", body: JSON.stringify(changes) }); await loadAccounts(); setNotice("Account updated."); } catch (err) { setError(err.message); } };
+  return <div className="settings-grid">
+    {error && <div className="login-error">{error}</div>}{notice && <div className="toast"><CheckCircle2 size={18}/>{notice}</div>}
+    {!staffOnly && <section className="card formcard"><p className="eyebrow">ACCOUNT SECURITY</p><h2>Change your password</h2><p>Use at least 12 characters. Your current password is required.</p><form className="fields" onSubmit={changePassword}><Field label="Current password" type="password" required value={password.currentPassword} change={value => setPassword({ ...password, currentPassword: value })}/><Field label="New password" type="password" required value={password.newPassword} change={value => setPassword({ ...password, newPassword: value })}/><button className="primary">Update password</button></form></section>}
+    {owner ? <><section className="card formcard"><p className="eyebrow">OWNER CONTROLS</p><h2>Add staff account</h2><p>Receptionists can run daily operations. Owners can also manage staff accounts.</p><form className="fields" onSubmit={addStaff}><Field label="Full name" required value={staff.name} change={value => setStaff({ ...staff, name: value })}/><Field label="Email" type="email" required value={staff.email} change={value => setStaff({ ...staff, email: value })}/><Field label="Temporary password" type="password" required value={staff.password} change={value => setStaff({ ...staff, password: value })}/><label>Role<select value={staff.role} onChange={e => setStaff({ ...staff, role: e.target.value })}><option>Receptionist</option><option>Owner</option></select></label><button className="primary">Create staff account</button></form></section>
+    <section className="card tablewrap settings-staff"><div className="section-head"><div><h2>Staff accounts</h2><p>{accounts.length} configured account{accounts.length === 1 ? "" : "s"}</p></div></div><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Access</th></tr></thead><tbody>{accounts.map(item => <tr key={item.id}><td><b>{item.name}</b>{item.id === account?.id && <small> · You</small>}</td><td>{item.email}</td><td><select value={item.role} onChange={e => updateStaff(item, { role: e.target.value })}><option>Owner</option><option>Receptionist</option></select></td><td><button className="secondary compact" onClick={() => updateStaff(item, { active: !item.active })}>{item.active ? "Disable" : "Enable"}</button></td></tr>)}</tbody></table></section></> : <section className="card settings"><span className="round violet"><ShieldCheck/></span><h2>Receptionist access</h2><p>Your account can handle members, payments, visitors, and QR check-ins. An owner manages staff access.</p></section>}
+  </div>;
 }
 createRoot(document.getElementById("root")).render(<App />);

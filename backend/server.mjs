@@ -4,6 +4,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual, scryptSync } from
 import { extname, join, normalize } from 'node:path';
 import { env } from './config/env.mjs';
 import { memberCreateSchema, renewalSchema, guestSchema } from './validation/member.mjs';
+import { accountCreateSchema, accountUpdateSchema, passwordChangeSchema } from './validation/account.mjs';
 import { addMembershipDays, currentMembership } from './services/membership-service.mjs';
 import { PostgresStateRepository } from './repositories/postgres-state-repository.mjs';
 import { pool } from './database/pool.mjs';
@@ -30,15 +31,30 @@ const verifyPassword = (value, stored) => {
   return timingSafeEqual(Buffer.from(actual),Buffer.from(expected));
 };
 const initialDb = {
-  admin: { id: 'admin-001', email: env.adminEmail.toLowerCase(), passwordHash: passwordHash(env.adminPassword), name: 'Alex Morgan' },
+  accounts: [{ id: 'admin-001', email: env.adminEmail.toLowerCase(), passwordHash: passwordHash(env.adminPassword), name: 'Alex Morgan', role: 'Owner', active: true }],
   state: { members: [], visits: [], payments: [] },
   createdAt: new Date().toISOString()
 };
-
+function normalizeAccounts(db) {
+  if (!Array.isArray(db.accounts)) {
+    const legacy = db.admin || initialDb.accounts[0];
+    db.accounts = [{ id: legacy.id || 'admin-001', email: String(legacy.email || env.adminEmail).toLowerCase(), passwordHash: legacy.passwordHash || passwordHash(env.adminPassword), name: legacy.name || 'Alex Morgan', role: 'Owner', active: true }];
+  }
+  db.accounts = db.accounts.map(account => ({ ...account, role: account.role === 'Receptionist' ? 'Receptionist' : 'Owner', active: account.active !== false, email: String(account.email).toLowerCase() }));
+  return db;
+}
+const publicAccount = account => ({ id: account.id, name: account.name, email: account.email, role: account.role, active: account.active });
+const ownerCount = db => db.accounts.filter(account => account.role === 'Owner' && account.active).length;
 async function readDb(){
-  if(stateRepository) { const database=await stateRepository.load(); if(!database.admin){ await stateRepository.save(initialDb); return initialDb; } return database; }
-  try { const db=JSON.parse(await readFile(DB_PATH, 'utf8')); if(!db.admin.passwordHash.startsWith('scrypt$')) { db.admin.passwordHash=passwordHash('flexmaster2026'); await writeDb(db); } return db; }
-  catch { await mkdir('./data', {recursive:true}); await writeDb(initialDb); return initialDb; }
+  if(stateRepository) { const database=await stateRepository.load(); if(!database.accounts?.length){ await stateRepository.save(initialDb); return initialDb; } return normalizeAccounts(database); }
+  try {
+    const db=normalizeAccounts(JSON.parse(await readFile(DB_PATH, 'utf8')));
+    if(!db.accounts.every(account => account.passwordHash?.startsWith('scrypt' + '$'))) {
+      db.accounts=db.accounts.map(account => account.passwordHash?.startsWith('scrypt' + '$') ? account : {...account,passwordHash:passwordHash(env.adminPassword)});
+      await writeDb(db);
+    }
+    return db;
+  } catch { await mkdir('./data', {recursive:true}); await writeDb(initialDb); return initialDb; }
 }
 async function writeDb(db){ if(stateRepository) return stateRepository.save(db); await mkdir('./data', {recursive:true}); await writeFile(DB_PATH, JSON.stringify(db, null, 2)); }
 function readBody(req){ return new Promise((resolve,reject)=>{ let raw=''; req.on('data',chunk=>{raw+=chunk;if(raw.length>700_000)req.destroy(new Error('Request body too large'));}); req.on('end',()=>{try{resolve(raw?JSON.parse(raw):{})}catch{reject(new Error('Invalid JSON body'))}}); req.on('error',reject); }); }
@@ -83,14 +99,24 @@ const server = createServer(async (req,res)=>{
       const address=clientAddress(req);
       if(!canAttemptLogin(address)) return json(res,429,{error:'Too many failed sign-in attempts. Try again in 15 minutes.'});
       const {email,password}=await readBody(req); const db=await readDb();
-      const valid=String(email||'').toLowerCase()===db.admin.email && verifyPassword(String(password||''),db.admin.passwordHash);
-      if(!valid) { recordLoginFailure(address); return json(res,401,{error:'Invalid email or password'}); }
+      const account=db.accounts.find(item => item.email===String(email||'').toLowerCase() && item.active);
+      if(!account || !verifyPassword(String(password||''),account.passwordHash)) { recordLoginFailure(address); return json(res,401,{error:'Invalid email or password'}); }
       loginFailures.delete(address);
-      const token=signSession({adminId:db.admin.id,exp:Date.now()+1000*60*60*12});
-      return json(res,200,{token,admin:{name:db.admin.name,email:db.admin.email}});
+      const token=signSession({accountId:account.id,role:account.role,exp:Date.now()+1000*60*60*12});
+      return json(res,200,{token,account:publicAccount(account)});
     }
     if(url.pathname.startsWith('/api/')){
       const session=auth(req); if(!session || session.exp<Date.now()) return json(res,401,{error:'Unauthorized'});
+      const authDb=await readDb();
+      const authenticatedAccount=authDb.accounts.find(account => account.id===session.accountId && account.active);
+      if(!authenticatedAccount) return json(res,401,{error:'Unauthorized'});
+      const ownerOnly = () => authenticatedAccount.role==='Owner';
+      if(req.method==='GET' && url.pathname==='/api/auth/me') return json(res,200,{account:publicAccount(authenticatedAccount)});
+      if(req.method==='GET' && url.pathname==='/api/accounts') { if(!ownerOnly()) return json(res,403,{error:'Owner access required'}); return json(res,200,authDb.accounts.map(publicAccount)); }
+      if(req.method==='POST' && url.pathname==='/api/accounts') { if(!ownerOnly()) return json(res,403,{error:'Owner access required'}); const parsed=accountCreateSchema.safeParse(await readBody(req)); if(!parsed.success) return json(res,422,{error:parsed.error.issues[0]?.message||'Invalid account details'}); if(authDb.accounts.some(account=>account.email===parsed.data.email)) return json(res,409,{error:'An account with this email already exists'}); const account={id:id('ACC'),name:parsed.data.name,email:parsed.data.email,passwordHash:passwordHash(parsed.data.password),role:parsed.data.role,active:true}; authDb.accounts.push(account); await writeDb(authDb); return json(res,201,publicAccount(account)); }
+      if(req.method==='POST' && url.pathname==='/api/auth/change-password') { const parsed=passwordChangeSchema.safeParse(await readBody(req)); if(!parsed.success) return json(res,422,{error:parsed.error.issues[0]?.message||'Invalid password'}); if(!verifyPassword(parsed.data.currentPassword,authenticatedAccount.passwordHash)) return json(res,401,{error:'Current password is incorrect'}); authenticatedAccount.passwordHash=passwordHash(parsed.data.newPassword); await writeDb(authDb); return json(res,200,{ok:true}); }
+      const accountMatch=url.pathname.match(/^\/api\/accounts\/([^/]+)$/);
+      if(req.method==='PUT' && accountMatch) { if(!ownerOnly()) return json(res,403,{error:'Owner access required'}); const parsed=accountUpdateSchema.safeParse(await readBody(req)); if(!parsed.success) return json(res,422,{error:parsed.error.issues[0]?.message||'Invalid account change'}); const account=authDb.accounts.find(item=>item.id===decodeURIComponent(accountMatch[1])); if(!account) return json(res,404,{error:'Account not found'}); const nextRole=parsed.data.role ?? account.role; const nextActive=parsed.data.active ?? account.active; if(account.role==='Owner' && account.active && (nextRole!=='Owner' || !nextActive) && ownerCount(authDb)===1) return json(res,409,{error:'At least one active owner account is required'}); account.role=nextRole; account.active=nextActive; await writeDb(authDb); return json(res,200,publicAccount(account)); }
       if(req.method==='GET' && url.pathname==='/api/state'){ const db=await readDb(); return json(res,200,db.state); }
       if(req.method==='GET' && url.pathname==='/api/members'){ const db=await readDb(); return json(res,200,db.state.members.map(currentMembership)); }
       if(req.method==='POST' && url.pathname==='/api/members'){
